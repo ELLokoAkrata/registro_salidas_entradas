@@ -14,7 +14,8 @@ os.environ["no_grpc_proxy"] = ",".join(sorted(_grpc_no_proxy))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from statistics import median
 import pytz
 import io
 import openpyxl
@@ -24,6 +25,7 @@ from openpyxl.styles import Border, Side
 # NUEVOS IMPORTS ---------------------------------------------
 import zipfile
 import re
+import hashlib
 # ------------------------------------------------------------
 
 # ---------------------------
@@ -54,36 +56,70 @@ db = firestore.client()
 # ---------------------------
 # CONFIGURACIÓN DE HORARIOS
 # ---------------------------
-ENTRY_DEADLINE = 11    # Se permite marcar entrada solo hasta las 11:00 AM
-EXIT_START = 18        # Se permite marcar salida solo hasta las 6:00 PM
+# El servidor de Streamlit Cloud corre en UTC. NUNCA se usa datetime.now()
+# directo: toda la hora de negocio pasa por ahora_lima() para que el día
+# cambie a medianoche de Lima y no a las 19:00.
+TZ_LIMA = pytz.timezone("America/Lima")
+FMT_FECHA_HORA = "%d/%m/%Y %I:%M:%S %p"
+
+ENTRADA_LIMITE = 11    # Se permite marcar entrada solo hasta las 11:00 AM
+SALIDA_LIMITE = 23     # Se permite marcar salida hasta las 23:59 (antes era 18:00)
+JORNADA = timedelta(hours=8)   # Jornada estándar del mecanismo anti-olvidos
+
+# Feriados nacionales de Perú 2026 (fuente: gob.pe/feriados). ACTUALIZAR CADA AÑO.
+FERIADOS = {
+    date(2026, 1, 1),                      # Año Nuevo
+    date(2026, 4, 2), date(2026, 4, 3),    # Jueves y Viernes Santo
+    date(2026, 5, 1),                      # Día del Trabajo
+    date(2026, 6, 7),                      # Batalla de Arica
+    date(2026, 6, 29),                     # San Pedro y San Pablo
+    date(2026, 7, 23),                     # Día de la Fuerza Aérea
+    date(2026, 7, 28), date(2026, 7, 29),  # Fiestas Patrias
+    date(2026, 8, 6),                      # Batalla de Junín
+    date(2026, 8, 30),                     # Santa Rosa de Lima
+    date(2026, 10, 8),                     # Combate de Angamos
+    date(2026, 11, 1),                     # Todos los Santos
+    date(2026, 12, 8), date(2026, 12, 9),  # Inmaculada / Ayacucho
+    date(2026, 12, 25),                    # Navidad
+}
 
 # ---------------------------
 # FUNCIONES AUXILIARES EXISTENTES
 # ---------------------------
+def ahora_lima():
+    """'Ahora' de negocio, SIEMPRE en hora de Lima.
+
+    En la nube el reloj del servidor está en UTC: usarlo directo hace que la
+    fecha (y con ella la semana) cambie a las 19:00 de Lima. Cualquier código
+    que necesite la fecha/hora actual debe llamar a esta función.
+    """
+    return datetime.now(TZ_LIMA)
+
+def es_feriado(fecha):
+    """True si la fecha (date) es feriado nacional de Perú."""
+    return fecha in FERIADOS
+
+def es_dia_laborable(fecha):
+    """Lunes a sábado, excluyendo feriados."""
+    return fecha.weekday() <= 5 and not es_feriado(fecha)
+
 def get_week_filename():
-    """Genera el nombre del archivo según el año y la semana actual."""
-    now = datetime.now()
-    year, week, _ = now.isocalendar()
+    """Genera el nombre del archivo según el año y la semana actual (hora de Lima)."""
+    year, week, _ = ahora_lima().isocalendar()
     return f"registro_{year}_W{week}.xlsx"
 
 def get_week_id(filename=None):
-    """Obtiene el ID de semana para Firestore (ej. '2026_W11') a partir del filename o la fecha actual."""
+    """Obtiene el ID de semana para Firestore (ej. '2026_W11') a partir del filename o la fecha actual (Lima)."""
     if filename:
         match = re.match(r"registro_(\d{4}_W\d+)\.xlsx", filename)
         if match:
             return match.group(1)
-    now = datetime.now()
-    year, week, _ = now.isocalendar()
+    year, week, _ = ahora_lima().isocalendar()
     return f"{year}_W{week}"
 
-def utc_to_lima(utc_dt):
-    """Convierte un datetime en UTC a la hora de Lima (America/Lima)."""
-    lima_tz = pytz.timezone("America/Lima")
-    return utc_dt.astimezone(lima_tz)
-
 def format_datetime(dt):
-    """Formatea el datetime a cadena, usando la hora de Lima."""
-    return utc_to_lima(dt).strftime("%d/%m/%Y %I:%M:%S %p")
+    """Formatea un datetime (ya en hora de Lima) a cadena."""
+    return dt.strftime(FMT_FECHA_HORA)
 
 def parse_timedelta(td_str):
     """Convierte una cadena tipo 'H:MM:SS' a un objeto timedelta."""
@@ -172,20 +208,22 @@ def save_week_data_and_upload(df, filename):
 def load_week_data(filename):
     """
     Carga el DataFrame desde Firestore.
+    Incluye la columna 'Origen' (REAL para marcas humanas, GENERADO_OLVIDO
+    para las completadas por el mecanismo anti-olvidos).
     Si no existen registros para la semana, retorna un DataFrame vacío.
     """
     week_id = get_week_id(filename)
     registros_ref = db.collection("semanas").document(week_id).collection("registros")
     docs = list(registros_ref.stream())
 
+    cols = ["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas", "Origen"]
     if docs:
         rows = [doc.to_dict() for doc in docs]
-        df = pd.DataFrame(rows)
-        cols = ["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"]
-        df = df.reindex(columns=cols)
+        df = pd.DataFrame(rows).reindex(columns=cols)
+        df["Origen"] = df["Origen"].fillna("REAL")
         return df
     else:
-        return pd.DataFrame(columns=["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"])
+        return pd.DataFrame(columns=cols)
 
 def update_firestore(worker, data):
     """
@@ -207,19 +245,20 @@ def register_event(worker, event_type):
     """
     filename = get_week_filename()
     df = load_week_data(filename)
-    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    now_utc = datetime.now(pytz.utc)
-    local_now = utc_to_lima(now_utc)
-    now_str = format_datetime(now_utc)
+    # Hora de negocio SIEMPRE en Lima: el servidor vive en UTC y cambia de
+    # día a las 19:00 de Lima, lo que corrompía la fecha del registro.
+    local_now = ahora_lima()
+    today_str = local_now.date().isoformat()
+    now_str = format_datetime(local_now)
 
     # Validar horario según tipo de evento
     if event_type == "entrada":
-        if local_now.hour >= ENTRY_DEADLINE:
-            return False, "Fuera del horario permitido para marcar entrada (hasta las 11:00 AM)."
+        if local_now.hour >= ENTRADA_LIMITE:
+            return False, f"Fuera del horario permitido para marcar entrada (hasta las {ENTRADA_LIMITE}:00 AM)."
     elif event_type == "salida":
-        if local_now.hour > EXIT_START or (local_now.hour == EXIT_START and local_now.minute > 0):
-            return False, "Fuera del horario permitido para marcar salida (hasta las 6:00 PM)."
+        if local_now.hour > SALIDA_LIMITE:
+            return False, f"Fuera del horario permitido para marcar salida (hasta las {SALIDA_LIMITE}:59)."
 
     record = df[(df["Nombre"] == worker) & (df["Fecha"] == today_str)]
 
@@ -232,7 +271,8 @@ def register_event(worker, event_type):
                 "Fecha": today_str,
                 "Entrada": now_str,
                 "Salida": "No marcó salida",
-                "Horas Trabajadas": "No marcó salida"
+                "Horas Trabajadas": "No marcó salida",
+                "Origen": "REAL",
             }
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         else:
@@ -251,8 +291,8 @@ def register_event(worker, event_type):
         idx = record.index[0]
         df.at[idx, "Salida"] = now_str
         try:
-            entry_time = datetime.strptime(df.at[idx, "Entrada"], "%d/%m/%Y %I:%M:%S %p")
-            exit_time = datetime.strptime(now_str, "%d/%m/%Y %I:%M:%S %p")
+            entry_time = datetime.strptime(df.at[idx, "Entrada"], FMT_FECHA_HORA)
+            exit_time = datetime.strptime(now_str, FMT_FECHA_HORA)
             worked = exit_time - entry_time
             df.at[idx, "Horas Trabajadas"] = str(worked)
         except Exception as e:
@@ -272,6 +312,120 @@ def get_worker_week_hours(worker):
     for _, row in records.iterrows():
         total += parse_timedelta(row["Horas Trabajadas"])
     return total
+
+# ---------------------------
+# MECANISMO ANTI-OLVIDOS
+# ---------------------------
+def _parse_fecha_hora(valor):
+    try:
+        return datetime.strptime(str(valor), FMT_FECHA_HORA)
+    except Exception:
+        return None
+
+def _minuto_aleatorio(nombre, fecha, low, high):
+    """Número estable por (trabajador, fecha): el mismo día siempre produce la misma hora."""
+    h = hashlib.md5(f"{nombre}|{fecha.isoformat()}".encode()).hexdigest()
+    return low + int(h[:8], 16) % (high - low + 1)
+
+def _entrada_simulada(nombre, fecha, base_min):
+    """Hora de entrada 'natural': base histórica del trabajador + jitter, acotada 07:30-10:45."""
+    minuto = int(base_min) + _minuto_aleatorio(nombre, fecha, -40, 40)
+    minuto = max(7 * 60 + 30, min(10 * 60 + 45, minuto))
+    dt = datetime.combine(fecha, datetime.min.time()) + timedelta(minutes=minuto)
+    return dt + timedelta(seconds=_minuto_aleatorio(nombre, fecha + timedelta(days=1), 0, 59))
+
+def completar_olvidados():
+    """
+    Anti-olvidos: revisa los días YA TERMINADOS de la semana actual y la
+    anterior, y completa lo que el trabajador no marcó:
+      - entrada sin salida -> salida = entrada + 8 h
+      - día sin registro   -> día completo (entrada estimada + 8 h)
+    Solo días laborables pasados (L-S, no feriado); NUNCA toca el día en
+    curso ni el futuro. Toda fila creada/modificada queda con
+    Origen = GENERADO_OLVIDO para no mezclarse con las marcas reales.
+    """
+    hoy = ahora_lima().date()
+    completados = []
+
+    for delta in (7, 0):  # semana anterior y semana actual
+        anio, semana, _ = (hoy - timedelta(days=delta)).isocalendar()
+        filename = f"registro_{anio}_W{semana}.xlsx"
+        df = load_week_data(filename)
+
+        # Base de entrada por trabajador: mediana de sus marcados reales
+        bases = {}
+        for nombre in df["Nombre"].unique():
+            minutos = [
+                dt.hour * 60 + dt.minute
+                for dt in (_parse_fecha_hora(v) for v in df[df["Nombre"] == nombre]["Entrada"])
+                if dt is not None
+            ]
+            bases[nombre] = median(minutos) if minutos else 8 * 60 + 30
+
+        cambio = False
+        for idx, row in df.iterrows():
+            try:
+                fecha = datetime.strptime(str(row["Fecha"]), "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if fecha >= hoy or not es_dia_laborable(fecha):
+                continue
+            nombre = row["Nombre"]
+            entrada_dt = _parse_fecha_hora(row["Entrada"])
+            salida_dt = _parse_fecha_hora(row["Salida"])
+
+            if entrada_dt and salida_dt is None:
+                df.at[idx, "Salida"] = format_datetime(entrada_dt + JORNADA)
+                df.at[idx, "Horas Trabajadas"] = "8:00:00"
+                df.at[idx, "Origen"] = "GENERADO_OLVIDO"
+                cambio = True
+                completados.append(f"{nombre} {fecha}: salida generada (entrada + 8 h)")
+            elif salida_dt and entrada_dt is None:
+                df.at[idx, "Entrada"] = format_datetime(salida_dt - JORNADA)
+                df.at[idx, "Horas Trabajadas"] = "8:00:00"
+                df.at[idx, "Origen"] = "GENERADO_OLVIDO"
+                cambio = True
+                completados.append(f"{nombre} {fecha}: entrada generada (salida - 8 h)")
+
+        # Días sin NINGÚN registro -> fila completa generada
+        existentes = {(str(r["Nombre"]), str(r["Fecha"])) for _, r in df.iterrows()}
+        lunes = datetime.fromisocalendar(anio, semana, 1).date()
+        filas_nuevas = []
+        for offset in range(7):
+            dia = lunes + timedelta(days=offset)
+            if dia >= hoy or not es_dia_laborable(dia):
+                continue
+            for nombre in user_list:
+                if (nombre, dia.isoformat()) in existentes:
+                    continue
+                ent = _entrada_simulada(nombre, dia, bases.get(nombre, 8 * 60 + 30))
+                filas_nuevas.append({
+                    "Nombre": nombre,
+                    "Fecha": dia.isoformat(),
+                    "Entrada": format_datetime(ent),
+                    "Salida": format_datetime(ent + JORNADA),
+                    "Horas Trabajadas": "8:00:00",
+                    "Origen": "GENERADO_OLVIDO",
+                })
+                completados.append(f"{nombre} {dia}: día completo generado")
+        if filas_nuevas:
+            df = pd.concat([df, pd.DataFrame(filas_nuevas)], ignore_index=True)
+            cambio = True
+
+        if cambio:
+            save_week_data_and_upload(df, filename)
+
+    return completados
+
+def revision_diaria_anti_olvidos():
+    """Ejecuta completar_olvidados() máximo una vez por día (marca en Firestore)."""
+    ref = db.collection("sistema").document("anti_olvidos")
+    hoy = ahora_lima().date().isoformat()
+    doc = ref.get()
+    if doc.exists and doc.to_dict().get("ultima_revision") == hoy:
+        return None
+    ref.set({"ultima_revision": hoy}, merge=True)
+    return completar_olvidados()
 
 # ---------------------------
 # NUEVA FUNCIÓN: GENERAR ARCHIVO MENSUAL
@@ -397,6 +551,17 @@ user_passwords = st.secrets["user_passwords"]
 
 st.title("Registro de Entradas y Salidas (CLOUD: Firestore)")
 
+# --- Mecanismo anti-olvidos: revisión diaria al abrir la app ---------------
+try:
+    _completados_hoy = revision_diaria_anti_olvidos()
+    if _completados_hoy:
+        st.caption(
+            f"Anti-olvidos: se completaron {len(_completados_hoy)} marcados de "
+            "días anteriores (quedan marcados como GENERADO_OLVIDO)."
+        )
+except Exception as e:
+    st.caption(f"Anti-olvidos no pudo ejecutarse: {e}")
+
 with st.expander("Selecciona al Trabajador"):
     worker = st.selectbox("Elige tu nombre:", [""] + user_list)
 
@@ -451,9 +616,9 @@ if worker:
                 st.subheader("Descarga de registros semanales")
 
                 # Valores de año y mes para filtros y descargas
-                current_year = datetime.now().year
+                current_year = ahora_lima().year
                 selected_year = st.session_state.get("selected_year", current_year)
-                selected_month = st.session_state.get("selected_month_num", datetime.now().month)
+                selected_month = st.session_state.get("selected_month_num", ahora_lima().month)
 
                 week_files = list_week_files()
 
@@ -514,7 +679,7 @@ if worker:
 
                 col_year, col_month = st.columns(2)
                 with col_year:
-                    current_year = datetime.now().year
+                    current_year = ahora_lima().year
                     selected_year = st.number_input(
                         "Elige el año",
                         min_value=2000,
@@ -541,7 +706,7 @@ if worker:
                     selected_month_name = st.selectbox(
                         "Elige el mes",
                         month_names,
-                        index=st.session_state.get("selected_month_num", datetime.now().month) - 1,
+                        index=st.session_state.get("selected_month_num", ahora_lima().month) - 1,
                         key="selected_month_name",
                     )
                     selected_month = month_names.index(selected_month_name) + 1
