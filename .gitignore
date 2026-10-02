@@ -1,0 +1,13 @@
+# Credenciales y secretos: NUNCA subir al repo
+.streamlit/secrets.toml
+*.json
+
+# Datos de trabajadores y artefactos locales
+registros_all.zip
+auditoria_2026.xlsx
+data_generada/
+logs-*.txt
+
+# Python
+__pycache__/
+*.pyc

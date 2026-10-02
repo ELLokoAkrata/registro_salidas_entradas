@@ -94,6 +94,24 @@ for v in gen["Entrada"]:
         ok_ventana = False
 check(ok_ventana, "entradas generadas dentro de la ventana 07:30-10:45")
 
+# 5) Log de auditoria en Firestore (mock): cada revision con completados queda registrada
+log_calls = [c for c in app.db.method_calls
+             if c[0] == "collection" and c[1] and c[1][0] == "sistema"]
+check(len(log_calls) >= 1, "revision con completados escribe log de auditoria")
+
+# 6) Aviso personalizado: marcas GENERADO_OLVIDO recientes por trabajador
+# Ventana de 15 dias desde el 1-oct: cubre W39 (6 dias generados por trabajador)
+# y W40 (Nelida 3, Paula 2, Ricardo 3)
+app.load_week_data = lambda f: saved.get(f, pd.DataFrame(columns=cols)).copy()
+n_nelida = len(app.marcas_generadas_recientes("Nelida Ruiz"))
+check(n_nelida == 9, f"aviso de Nelida: 6 (W39) + 3 (W40), hay {n_nelida}")
+n_paula = len(app.marcas_generadas_recientes("Paula Lecaros"))
+check(n_paula == 8, f"aviso de Paula: 6 (W39) + 2 (W40), hay {n_paula}")
+n_ricardo = len(app.marcas_generadas_recientes("Ricardo Adrian Ruiz"))
+check(n_ricardo == 9, f"aviso de Ricardo: 6 (W39) + 3 (W40), hay {n_ricardo}")
+check(app.marcas_generadas_recientes("Trabajador Inexistente") == [],
+      "trabajador sin marcas generadas -> aviso vacio")
+
 print()
 if FALLOS:
     print(f"{len(FALLOS)} PRUEBAS FALLARON")

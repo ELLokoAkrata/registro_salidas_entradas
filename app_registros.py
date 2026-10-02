@@ -415,6 +415,14 @@ def completar_olvidados():
         if cambio:
             save_week_data_and_upload(df, filename)
 
+    if completados:
+        # Log de auditoria: queda constancia de cuando se genero cada marca
+        db.collection("sistema").document("anti_olvidos_log").collection("revisiones").add({
+            "generado_en": format_datetime(ahora_lima()),
+            "cantidad": len(completados),
+            "detalle": completados,
+        })
+
     return completados
 
 def revision_diaria_anti_olvidos():
@@ -426,6 +434,40 @@ def revision_diaria_anti_olvidos():
         return None
     ref.set({"ultima_revision": hoy}, merge=True)
     return completar_olvidados()
+
+def marcas_generadas_recientes(worker, dias=15):
+    """
+    Marcas GENERADO_OLVIDO del trabajador en los ultimos N dias,
+    para el aviso personalizado que se muestra al iniciar sesion.
+    """
+    hoy = ahora_lima().date()
+    desde = hoy - timedelta(days=dias)
+    semanas = sorted({
+        (desde + timedelta(days=i)).isocalendar()[:2]
+        for i in range(dias + 1)
+    })
+    avisos = []
+    for anio, semana in semanas:
+        df = load_week_data(f"registro_{anio}_W{semana}.xlsx")
+        if df.empty:
+            continue
+        gen = df[(df["Nombre"] == worker) & (df["Origen"] == "GENERADO_OLVIDO")]
+        for _, row in gen.iterrows():
+            try:
+                fecha = datetime.strptime(str(row["Fecha"]), "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if fecha < desde or fecha >= hoy:
+                continue
+            ent = _parse_fecha_hora(row["Entrada"])
+            sal = _parse_fecha_hora(row["Salida"])
+            detalle = str(row["Fecha"])
+            if ent and sal:
+                detalle = (f"{fecha.strftime('%d/%m/%Y')} - "
+                           f"entrada {ent.strftime('%I:%M %p')}, "
+                           f"salida {sal.strftime('%I:%M %p')} (8 h)")
+            avisos.append(detalle)
+    return sorted(set(avisos))
 
 # ---------------------------
 # NUEVA FUNCIÓN: GENERAR ARCHIVO MENSUAL
@@ -575,6 +617,20 @@ if worker:
             else:
                 st.info(f"Bienvenido, {worker}.")
 
+            # Aviso personalizado: marcas que el anti-olvidos completo por el usuario
+            try:
+                generadas = marcas_generadas_recientes(worker)
+                if generadas:
+                    st.warning(
+                        f"El sistema completo {len(generadas)} marcado(s) tuyo(s) por olvido "
+                        "(quedan como GENERADO_OLVIDO). Si algun dato no corresponde, "
+                        "avisale al administrador:"
+                    )
+                    for item in generadas:
+                        st.caption(f"- {item}")
+            except Exception as e:
+                st.caption(f"No se pudo revisar tus marcas generadas: {e}")
+
             st.header(f"Registro para: {worker}")
 
             col1, col2 = st.columns(2)
@@ -671,6 +727,33 @@ if worker:
                                 file_name="registros_all.zip",
                                 mime="application/zip"
                             )
+
+                # --- Auditoría del anti-olvidos: cuándo se generó cada marca ---
+                st.markdown("---")
+                st.subheader("Auditoría del anti-olvidos")
+                if st.button("Ver auditoría del anti-olvidos"):
+                    log_docs = list(
+                        db.collection("sistema")
+                          .document("anti_olvidos_log")
+                          .collection("revisiones")
+                          .stream()
+                    )
+                    if not log_docs:
+                        st.info("Aún no hay revisiones con marcados completados.")
+                    else:
+                        rows = []
+                        for d in log_docs:
+                            data = d.to_dict()
+                            detalle = data.get("detalle", [])
+                            rows.append({
+                                "Revisión del": data.get("generado_en", ""),
+                                "Marcados completados": data.get("cantidad", 0),
+                                "Detalle": " | ".join(detalle) if isinstance(detalle, list) else str(detalle),
+                            })
+                        df_log = pd.DataFrame(rows).sort_values(
+                            "Revisión del", ascending=False
+                        ).reset_index(drop=True)
+                        st.dataframe(df_log)
 
             # --- Sección ADMIN: Generar y descargar archivo mensual -----------
             if worker == "Ricardo Adrian Ruiz":
